@@ -4,38 +4,59 @@ import innertube
 import urllib.parse
 import re
 import requests
+import os
+import sys
 
 app = Flask(__name__)
 
-# Configura o Flask para aceitar Emojis e acentos nativos sem escapar para ASCII
 app.config['JSON_AS_ASCII'] = False
 app.json.ensure_ascii = False
 
-
 @app.after_request
 def force_utf8_charset(response):
-    # Sem isso, o header vem só "Content-Type: application/json" (sem charset).
-    # O corpo já está em UTF-8 correto, mas alguns clientes (curl antigo, certas
-    # libs HTTP) assumem Latin-1/ISO-8859-1 quando o charset não vem explícito,
-    # e é isso que produz o "parÃ¢metro" em vez de "parâmetro" na exibição.
     if response.mimetype == 'application/json':
         response.headers['Content-Type'] = 'application/json; charset=utf-8'
     return response
 
+# ============================================================================
+# CONFIGURAÇÃO DE COOKIES COM CAMINHO ABSOLUTO
+# ============================================================================
+# Obtém o diretório onde este script está localizado
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Caminho absoluto para o cookies.txt
+COOKIES_FILE = os.environ.get('COOKIES_FILE', os.path.join(BASE_DIR, 'cookies.txt'))
+COOKIES_AVAILABLE = os.path.isfile(COOKIES_FILE)
+
+# LOGS DE DEPURAÇÃO (aparecerão no pm2 logs)
+print(f"[DEBUG] BASE_DIR = {BASE_DIR}")
+print(f"[DEBUG] COOKIES_FILE = {COOKIES_FILE}")
+print(f"[DEBUG] COOKIES_AVAILABLE = {COOKIES_AVAILABLE}")
+print(f"[DEBUG] PATH = {os.environ.get('PATH')}")
+
+# Verifica se o Node.js está acessível
+node_available = os.system('which node > /dev/null 2>&1') == 0
+print(f"[DEBUG] Node disponível? {node_available}")
+
+if not COOKIES_AVAILABLE:
+    print("[AVISO] cookies.txt não encontrado — seguindo sem autenticação.")
+
+# ============================================================================
+# OPÇÕES BASE DO YT-DLP
+# ============================================================================
 YDL_OPTS_BASE = {
     'quiet': True,
     'no_warnings': True,
     'noplaylist': True,
     'skip_download': True,
     'no_cached_dir': True,
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['ios', 'android', 'web_embedded']
-        }
-    }
+    'js_runtimes': {'node': {}},
+    'remote_components': {'ejs:github'},
 }
 
-# Mapa de extensão real -> Content-Type correto.
+if COOKIES_AVAILABLE:
+    YDL_OPTS_BASE['cookiefile'] = COOKIES_FILE
+
+# Mapa de extensões
 MIME_MAP = {
     'mp4': 'video/mp4',
     'webm': 'video/webm',
@@ -49,22 +70,12 @@ MIME_MAP = {
 }
 
 # ============================================================================
-# INNERTUBE — API interna do YouTube (a mesma que o app/site usam), acessada
-# via pacote innertube. Usada nas rotas /search e /info no lugar de
-# youtube-search-python (que estava corrompendo ç/acentos/emojis) e do
-# yt-dlp (mais lento pra só listar qualidades). Os clientes ficam abertos
-# em memória (instanciados uma vez, no carregamento do módulo) pra resposta
-# em milissegundos, sem reconectar a cada request.
+# INNERTUBE
 # ============================================================================
-
-client_yt = innertube.InnerTube("WEB")          # melhor pra busca (mais completo + paginação)
-client_yt_android = innertube.InnerTube("ANDROID")  # formatos com URL direta, sem "signatureCipher"
-
+client_yt = innertube.InnerTube("WEB")
+client_yt_android = innertube.InnerTube("ANDROID")
 
 def find_keys(obj, key_name):
-    """Varre recursivamente a resposta do innertube procurando por uma chave,
-    em vez de depender de um caminho fixo (o Google muda a estrutura com
-    frequência, então isso deixa o parser bem mais resistente a mudanças)."""
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k == key_name:
@@ -74,15 +85,12 @@ def find_keys(obj, key_name):
         for item in obj:
             yield from find_keys(item, key_name)
 
-
 def extract_video_id(text):
-    """Extrai o ID de 11 caracteres de qualquer formato de link do YouTube."""
     match = re.search(
         r'(?:youtu\.be/|youtube\.com/(?:watch\?v=|shorts/|embed/|v/)|[?&]v=)([\w-]{11})',
         text
     )
     return match.group(1) if match else None
-
 
 def format_duration(seconds):
     try:
@@ -95,7 +103,6 @@ def format_duration(seconds):
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
 
-
 def best_thumbnail(thumbnails, video_id=None):
     if thumbnails:
         return thumbnails[-1].get('url')
@@ -103,27 +110,21 @@ def best_thumbnail(thumbnails, video_id=None):
         return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
     return None
 
-
 def parse_video_renderer(vr):
-    """Converte um videoRenderer (item de resultado de busca) pro formato de saída da API."""
     video_id = vr.get('videoId')
     if not video_id:
         return None
-
     title = None
     if vr.get('title', {}).get('runs'):
         title = vr['title']['runs'][0].get('text')
     elif vr.get('title', {}).get('simpleText'):
         title = vr['title']['simpleText']
-
     channel = None
     if vr.get('ownerText', {}).get('runs'):
         channel = vr['ownerText']['runs'][0].get('text')
     elif vr.get('longBylineText', {}).get('runs'):
         channel = vr['longBylineText']['runs'][0].get('text')
-
     duration = vr.get('lengthText', {}).get('simpleText', 'AO VIVO')
-
     return {
         "title": title,
         "channel": channel,
@@ -132,9 +133,7 @@ def parse_video_renderer(vr):
         "url": f"https://www.youtube.com/watch?v={video_id}"
     }
 
-
 def parse_video_details(video_details):
-    """Converte o videoDetails (retornado pela rota 'player') no mesmo formato do /search."""
     video_id = video_details.get('videoId')
     return {
         "title": video_details.get('title'),
@@ -144,10 +143,7 @@ def parse_video_details(video_details):
         "url": f"https://www.youtube.com/watch?v={video_id}"
     }
 
-
 def get_player_data(video_id):
-    """Chama client.player() do innertube. Tenta ANDROID primeiro (URLs diretas),
-    e cai pro WEB se o vídeo não vier disponível nesse cliente."""
     for client in (client_yt_android, client_yt):
         try:
             data = client.player(video_id)
@@ -158,57 +154,13 @@ def get_player_data(video_id):
             return data, video_details
     return None, None
 
-
-def yt_dlp_qualities_fallback(video_url):
-    """Fallback pra quando o Innertube não devolve NENHUMA qualidade com URL
-    direta. Isso acontece porque, hoje em dia, o YouTube exige um PO Token
-    (proof-of-origin) pra maioria dos formatos — sem ele, os formatos vêm com
-    'signatureCipher' (URL criptografada) em vez de 'url'. O yt-dlp tem lógica
-    própria mais robusta pra contornar isso, então é usado como plano B.
-    É bem mais lento que o Innertube (por isso não é o caminho padrão)."""
-    with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True, 'skip_download': True}) as ydl:
-        info_dict = ydl.extract_info(video_url, download=False)
-
-    qualities = []
-    for f in info_dict.get('formats', []):
-        if not f.get('url'):
-            continue
-        vcodec = f.get('vcodec', 'none')
-        is_audio_only = vcodec == 'none' or vcodec is None
-        qualities.append({
-            "format_id": str(f.get('format_id')),
-            "ext": f.get('ext'),
-            "mime_type": None,
-            "quality_label": f.get('format_note') or f.get('resolution') or f.get('quality'),
-            "type": "audio" if is_audio_only else "video"
-        })
-
-    base_info = {
-        "title": info_dict.get('title'),
-        "channel": info_dict.get('uploader'),
-        "duration": format_duration(info_dict.get('duration')),
-        "thumbnail": info_dict.get('thumbnail'),
-        "url": info_dict.get('webpage_url') or video_url
-    }
-    return base_info, qualities
-
-
-MAX_SEARCH_RESULTS = 200   # teto de segurança pra não deixar a resposta gigante/lenta
-MAX_SEARCH_PAGES = 10      # cada página de continuation costuma trazer ~20 vídeos
-
+MAX_SEARCH_RESULTS = 200
+MAX_SEARCH_PAGES = 10
 
 def innertube_search_all(query, max_pages=1):
-    """Busca via innertube. Por padrão faz UMA chamada só (max_pages=1), que é o
-    que deixa a rota instantânea — igual client_yt.search(query) sozinho.
-    Cada página extra (continuation) exige uma nova requisição sequencial ao
-    YouTube (o token da página N só existe depois da resposta da página N-1,
-    então não dá pra paralelizar), então passar max_pages > 1 troca velocidade
-    por mais resultados."""
     results = []
     seen_ids = set()
-
     data = client_yt.search(query)
-
     for _ in range(max(1, max_pages)):
         for vr in find_keys(data, 'videoRenderer'):
             parsed = parse_video_renderer(vr)
@@ -219,23 +171,18 @@ def innertube_search_all(query, max_pages=1):
                 continue
             seen_ids.add(vid)
             results.append(parsed)
-
             if len(results) >= MAX_SEARCH_RESULTS:
                 return results
-
         token = next((cc.get('token') for cc in find_keys(data, 'continuationCommand') if cc.get('token')), None)
         if not token:
             break
-
         data = client_yt.search(continuation=token)
-
     return results
 
+# ============================================================================
+# ROTAS
+# ============================================================================
 
-# 🌐 ROTA 1: Busca Instantânea — Innertube (API interna do YouTube)
-# Por padrão retorna só a 1ª página (~20 resultados, resposta em milissegundos).
-# Pra trazer mais, passe ?pages=N (N até 10) — cada página a mais soma uma
-# requisição sequencial extra ao YouTube, então a resposta fica mais lenta.
 @app.route('/search', methods=['GET'])
 def search():
     q = request.args.get('q')
@@ -273,11 +220,6 @@ def search():
     except Exception as e:
         return jsonify({"success": False, "error": "nada encontrado, tente outro termo", "details": str(e)}), 404
 
-
-
-# 🌐 ROTA 2: Informações de Qualidade — Innertube (rápido) com fallback pro
-# yt-dlp (mais lento, porém confiável) quando o YouTube exige PO Token e o
-# Innertube não devolve nenhum formato com URL direta.
 @app.route('/info', methods=['GET'])
 def info():
     url = request.args.get('url')
@@ -295,26 +237,19 @@ def info():
     qualities = []
     source = "innertube"
 
-    # 1) Tentativa rápida via Innertube
     try:
         data, video_details = get_player_data(video_id)
         if video_details:
             base_info = parse_video_details(video_details)
-
             streaming_data = next(find_keys(data, 'streamingData'), {}) or {}
             raw_formats = streaming_data.get('formats', []) + streaming_data.get('adaptiveFormats', [])
-
             for f in raw_formats:
                 if not f.get('url'):
-                    # "signatureCipher" — precisa de PO Token/decifra pra virar URL
-                    # utilizável. Fica de fora daqui; se sobrar nada, cai no yt-dlp.
                     continue
-
                 mime = f.get('mimeType', '')
                 ext_match = re.search(r'/(\w+)', mime)
                 ext = ext_match.group(1) if ext_match else None
                 is_video = bool(f.get('qualityLabel'))
-
                 qualities.append({
                     "format_id": str(f.get('itag')),
                     "ext": ext,
@@ -323,16 +258,33 @@ def info():
                     "type": "video" if is_video else "audio"
                 })
     except Exception:
-        pass  # segue pro fallback abaixo
+        pass
 
-    # 2) Se o Innertube não trouxe NENHUMA qualidade usável (comum hoje em dia
-    # por causa do PO Token), cai pro yt-dlp — mais lento, porém mais confiável.
     if not qualities:
         try:
-            fallback_base, qualities = yt_dlp_qualities_fallback(watch_url)
+            with yt_dlp.YoutubeDL({**YDL_OPTS_BASE, 'format': 'best'}) as ydl:
+                info_dict = ydl.extract_info(watch_url, download=False)
             source = "yt-dlp"
             if not base_info:
-                base_info = fallback_base
+                base_info = {
+                    "title": info_dict.get('title'),
+                    "channel": info_dict.get('uploader'),
+                    "duration": format_duration(info_dict.get('duration')),
+                    "thumbnail": info_dict.get('thumbnail'),
+                    "url": watch_url
+                }
+            for f in info_dict.get('formats', []):
+                if not f.get('url'):
+                    continue
+                vcodec = f.get('vcodec', 'none')
+                is_audio_only = vcodec == 'none' or vcodec is None
+                qualities.append({
+                    "format_id": str(f.get('format_id')),
+                    "ext": f.get('ext'),
+                    "mime_type": None,
+                    "quality_label": f.get('format_note') or f.get('resolution') or f.get('quality'),
+                    "type": "audio" if is_audio_only else "video"
+                })
         except Exception as e:
             if not base_info:
                 return jsonify({"success": False, "error": "Erro ao ler qualidades.", "details": str(e)}), 500
@@ -347,12 +299,6 @@ def info():
         "available_qualities": qualities
     })
 
-
-# 🌐 ROTA 3: Resolve Rápido
-# CORRIGIDA: força H.264 (avc1) no vídeo e AAC (m4a) no áudio sempre que
-# possível, porque AV1/VP9 e Opus/WebM não são suportados nativamente pelo
-# iOS (Photos/Files recusam salvar/tocar). Continua devolvendo vídeo e áudio
-# como duas URLs separadas (downloadUrl + audioUrl), igual antes — sem merge.
 @app.route('/resolve', methods=['GET'])
 def resolve():
     url = request.args.get('url')
@@ -363,27 +309,148 @@ def resolve():
         return jsonify({"success": False, "error": "Parâmetros inválidos."}), 400
 
     decoded_url = urllib.parse.unquote(url)
+    video_id = extract_video_id(decoded_url)
+    if not video_id:
+        return jsonify({"success": False, "error": "URL inválida."}), 400
 
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    # --- 1) TENTATIVA RÁPIDA: INNERTUBE ANDROID ---
+    try:
+        data, _ = get_player_data(video_id)
+        streaming_data = next(find_keys(data, 'streamingData'), {})
+        formats = streaming_data.get('formats', [])
+        adaptive = streaming_data.get('adaptiveFormats', [])
+
+        target_height = None
+        if type_param == 'mp4' and quality and quality.endswith('p'):
+            try:
+                target_height = int(quality[:-1])
+            except:
+                pass
+
+        best_video = None
+        best_video_height = -1
+        for f in adaptive + formats:
+            if f.get('url') and f.get('qualityLabel'):
+                height_str = f['qualityLabel'].replace('p', '')
+                if height_str.isdigit():
+                    height = int(height_str)
+                    if (target_height is None or height <= target_height) and height > best_video_height:
+                        best_video = f
+                        best_video_height = height
+
+        best_audio = None
+        for f in adaptive + formats:
+            if f.get('url') and f.get('audioQuality'):
+                mime = f.get('mimeType', '')
+                if 'mp4a' in mime:
+                    best_audio = f
+                    break
+                elif not best_audio:
+                    best_audio = f
+
+        if best_video and best_audio:
+            v_url = best_video['url']
+            a_url = best_audio['url']
+            v_ext = re.search(r'/(\w+)', best_video.get('mimeType', '')).group(1) if 'mimeType' in best_video else 'mp4'
+            a_ext = re.search(r'/(\w+)', best_audio.get('mimeType', '')).group(1) if 'mimeType' in best_audio else 'm4a'
+            title = "download"
+            try:
+                video_details = next(find_keys(data, 'videoDetails'), {})
+                if video_details:
+                    title = video_details.get('title', 'download')
+            except:
+                pass
+            host = request.host
+            protocol = 'https' if request.is_secure else 'http'
+            proxy_video = f"{protocol}://{host}/download-stream?url={urllib.parse.quote(v_url)}&ext={v_ext}&title={urllib.parse.quote(title + '_video')}"
+            proxy_audio = f"{protocol}://{host}/download-stream?url={urllib.parse.quote(a_url)}&ext={a_ext}&title={urllib.parse.quote(title + '_audio')}"
+            return jsonify({
+                "success": True,
+                "title": title,
+                "type": "split",
+                "videoExt": v_ext,
+                "audioExt": a_ext,
+                "quality": best_video_height if best_video_height > 0 else None,
+                "downloadUrl": proxy_video,
+                "audioUrl": proxy_audio
+            })
+
+        if best_video:
+            v_url = best_video['url']
+            v_ext = re.search(r'/(\w+)', best_video.get('mimeType', '')).group(1) if 'mimeType' in best_video else 'mp4'
+            title = "download"
+            try:
+                video_details = next(find_keys(data, 'videoDetails'), {})
+                if video_details:
+                    title = video_details.get('title', 'download')
+            except:
+                pass
+            host = request.host
+            protocol = 'https' if request.is_secure else 'http'
+            proxy_url = f"{protocol}://{host}/download-stream?url={urllib.parse.quote(v_url)}&ext={v_ext}&title={urllib.parse.quote(title)}"
+            return jsonify({
+                "success": True,
+                "title": title,
+                "type": "mp4",
+                "quality": best_video_height if best_video_height > 0 else None,
+                "downloadUrl": proxy_url
+            })
+
+        if type_param == 'mp3' and best_audio:
+            a_url = best_audio['url']
+            a_ext = re.search(r'/(\w+)', best_audio.get('mimeType', '')).group(1) if 'mimeType' in best_audio else 'm4a'
+            title = "download"
+            try:
+                video_details = next(find_keys(data, 'videoDetails'), {})
+                if video_details:
+                    title = video_details.get('title', 'download')
+            except:
+                pass
+            host = request.host
+            protocol = 'https' if request.is_secure else 'http'
+            proxy_url = f"{protocol}://{host}/download-stream?url={urllib.parse.quote(a_url)}&ext={a_ext}&title={urllib.parse.quote(title + '_audio')}"
+            return jsonify({
+                "success": True,
+                "title": title,
+                "type": "audio",
+                "quality": None,
+                "downloadUrl": proxy_url
+            })
+
+    except Exception:
+        pass
+
+    # --- 2) FALLBACK: YT-DLP COM SELETOR PRIORIZANDO QUALIDADE ---
     if type_param == 'mp3':
-        # Prioriza áudio já em AAC/M4A (compatível universalmente).
-        # Só cai pro bestaudio genérico (pode vir Opus/WebM) se nada m4a existir.
         format_selector = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio"
     else:
         quality_num = quality.replace('p', '') if quality else None
         height_filter = f"[height<={quality_num}]" if quality_num else ""
+        # Prioriza qualidade máxima, depois MP4, depois qualquer
         format_selector = (
-            f"bestvideo[vcodec^=avc1]{height_filter}[ext=mp4]+bestaudio[ext=m4a]/"
-            f"bestvideo[vcodec^=avc1]{height_filter}+bestaudio[ext=m4a]/"
-            f"best[vcodec^=avc1][ext=mp4]{height_filter}/"
-            f"best[ext=mp4]{height_filter}/best"
+            f"bestvideo{height_filter}+bestaudio/best{height_filter}/"
+            f"bestvideo[ext=mp4]{height_filter}+bestaudio[ext=m4a]/"
+            f"best[ext=mp4]{height_filter}/"
+            "best"
         )
 
-    try:
-        with yt_dlp.YoutubeDL({**YDL_OPTS_BASE, 'format': format_selector}) as ydl:
-            info_dict = ydl.extract_info(decoded_url, download=False)
+    tentativas = [
+        {**YDL_OPTS_BASE, 'format': format_selector},
+        {**YDL_OPTS_BASE, 'format': format_selector, 'cookiefile': None},
+        {**YDL_OPTS_BASE, 'format': format_selector, 'extractor_args': {'youtube': {'player_client': ['android']}}},
+        {**YDL_OPTS_BASE, 'format': format_selector, 'cookiefile': None, 'extractor_args': {'youtube': {'player_client': ['android']}}},
+        {**YDL_OPTS_BASE, 'format': 'best'},  # último recurso
+    ]
+
+    last_error = None
+    for opts in tentativas:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info_dict = ydl.extract_info(watch_url, download=False)
             requested_formats = info_dict.get('requested_formats')
             video_title = info_dict.get('title', 'download')
-
             host = request.host
             protocol = 'https' if request.is_secure else 'http'
 
@@ -392,38 +459,38 @@ def resolve():
                 v_ext = requested_formats[0].get('ext', 'mp4')
                 a_url = requested_formats[1].get('url')
                 a_ext = requested_formats[1].get('ext', 'm4a')
-
+                quality_val = requested_formats[0].get('height')
                 proxy_video = f"{protocol}://{host}/download-stream?url={urllib.parse.quote(v_url)}&ext={v_ext}&title={urllib.parse.quote(video_title + '_video')}"
                 proxy_audio = f"{protocol}://{host}/download-stream?url={urllib.parse.quote(a_url)}&ext={a_ext}&title={urllib.parse.quote(video_title + '_audio')}"
-
                 return jsonify({
                     "success": True,
                     "title": video_title,
                     "type": "split",
                     "videoExt": v_ext,
                     "audioExt": a_ext,
-                    "quality": info_dict.get('height'),
+                    "quality": quality_val,
                     "downloadUrl": proxy_video,
                     "audioUrl": proxy_audio
                 })
 
-            # Formato único (já vem com áudio+vídeo juntos, ou é só áudio).
             direct_url = info_dict.get('url')
             direct_ext = info_dict.get('ext', type_param)
+            quality_val = info_dict.get('height') or info_dict.get('format_note')
             proxy_url = f"{protocol}://{host}/download-stream?url={urllib.parse.quote(direct_url)}&ext={direct_ext}&title={urllib.parse.quote(video_title)}"
-
             return jsonify({
                 "success": True,
                 "title": video_title,
                 "type": direct_ext,
-                "quality": info_dict.get('height') or info_dict.get('format_note'),
+                "quality": quality_val,
                 "downloadUrl": proxy_url
             })
-    except Exception as e:
-        return jsonify({"success": False, "error": "Qualidade não disponível.", "details": str(e)}), 400
 
+        except Exception as e:
+            last_error = e
+            continue
 
-# 🌐 ROTA 4: Proxy Stream Turbo (Armazenamento ZERO / Buffer de Alta Velocidade de 1MB)
+    return jsonify({"success": False, "error": "Qualidade não disponível.", "details": str(last_error)}), 400
+
 @app.route('/download-stream', methods=['GET'])
 def download_stream():
     target_url = request.args.get('url')
@@ -486,7 +553,5 @@ def download_stream():
     except Exception as e:
         return f"Erro no tunelamento do arquivo: {str(e)}", 500
 
-
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=3000, debug=False, threaded=True)
-~/yt2dl $ 
