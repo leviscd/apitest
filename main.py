@@ -27,7 +27,12 @@ YDL_OPTS_BASE = {
     'no_warnings': True,
     'noplaylist': True,
     'skip_download': True,
-    'no_cached_dir': True
+    'no_cached_dir': True,
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['ios', 'android', 'web_embedded']
+        }
+    }
 }
 
 # Mapa de extensão real -> Content-Type correto.
